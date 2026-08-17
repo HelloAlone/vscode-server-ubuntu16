@@ -1,0 +1,4 @@
+/upstream/builddir*
+/upstream/deps
+/upstream/dist
+/upstream/tests/logs
