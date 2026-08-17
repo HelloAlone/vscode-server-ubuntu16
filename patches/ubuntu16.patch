@@ -1,0 +1,144 @@
+diff --git a/Makefile b/Makefile
+index 845e2ed..e559c0c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,5 +1,5 @@
+ PROD_VER = $(shell cat version.txt)
+-BUILD_TRIPLET = $(shell uname -m)-redhat-linux
++BUILD_TRIPLET = $(shell uname -m)-pc-linux-gnu
+ ARCH := $(shell uname -m)
+ 
+ ifeq ($(ARCH), x86_64)
+@@ -49,6 +49,7 @@ CROSS_CXX = $(CROSS_PREFIX)g++
+ CROSS_STRIP = $(TOOLCHAIN_DIR)/$(TARGET_TRIPLET)/bin/strip
+ CROSS_LIBDIR = $(TOOLCHAIN_DIR)/$(TARGET_TRIPLET)/lib
+ CROSS_LIB64DIR = $(TOOLCHAIN_DIR)/$(TARGET_TRIPLET)/lib64
++CROSS_SYSROOT_FLAGS = --sysroot=/
+ TOOLCHAIN = $(CROSS_CC) $(CROSS_CXX) $(CROSS_STRIP)
+ 
+ INCLUDES = -I.
+@@ -64,17 +65,17 @@ toolchain: $(TOOLCHAIN)
+ $(VSCODE_DEPS) $(TOOLCHAIN_DEPS):
+ 	env TARGET_TRIPLET='$(TARGET_TRIPLET)' bash scripts/download-deps.sh
+ 
+-$(CROSS_CC) $(CROSS_CXX) $(CROSS_STRIP): $(TOOLCHAIN_DEPS)
++$(CROSS_CC) $(CROSS_CXX) $(CROSS_STRIP): $(TOOLCHAIN_DEPS) scripts/build-gcc-toolchain.sh patches/glibc.patch
+ 	env BUILD_TRIPLET='$(BUILD_TRIPLET)' TARGET_TRIPLET='$(TARGET_TRIPLET)' BUILDDIR='$(shell realpath $(BUILDDIR))' bash scripts/build-gcc-toolchain.sh
+ 
+ $(LIBFASTJSON): $(TOOLCHAIN)
+-	cd libfastjson && ./autogen.sh CC='$(shell realpath $(CROSS_CC))' --prefix='$(shell realpath $(BUILDDIR))' --build='$(BUILD_TRIPLET)' --host='$(TARGET_TRIPLET)' && $(MAKE) clean && $(MAKE) install
++	cd libfastjson && ./autogen.sh CC='$(shell realpath $(CROSS_CC)) $(CROSS_SYSROOT_FLAGS)' --prefix='$(shell realpath $(BUILDDIR))' --build='$(BUILD_TRIPLET)' --host='$(TARGET_TRIPLET)' && $(MAKE) clean && $(MAKE) install
+ 
+ $(LIBPATCHELF): $(TOOLCHAIN)
+ 	cd libpatchelf && $(MAKE) clean && $(MAKE) LIBDIR='$(shell realpath $(LIBDIR))' CROSS_PREFIX='$(shell realpath $(CROSS_PREFIX))'
+ 
+ $(CODEBIN): $(TOOLCHAIN) $(CODESRC) $(HEADERS) $(LIBFASTJSON) $(LIBPATCHELF)
+-	$(CROSS_CC) $(CFLAGS) -o $(CODEBIN) $(CODESRC) $(LIBFASTJSON) $(LIBPATCHELF) $(LDFLAGS)
++	$(CROSS_CC) $(CROSS_SYSROOT_FLAGS) $(CFLAGS) -o $(CODEBIN) $(CODESRC) $(LIBFASTJSON) $(LIBPATCHELF) $(LDFLAGS)
+ 	$(CROSS_STRIP) --strip-all -R .comment $(CODEBIN)
+ 
+ $(VSCODE_SERVER_TAR): $(VSCODE_DEPS) $(TOOLCHAIN) $(CLI_TAR) $(SRV_TAR) $(CODEBIN)
+@@ -92,4 +93,5 @@ $(VSCODE_SERVER_TAR): $(VSCODE_DEPS) $(TOOLCHAIN) $(CLI_TAR) $(SRV_TAR) $(CODEBIN)
+ 	mkdir -p $(VSCODE_SERVER_DIR)/gnu
++	if [ -e '$(TOOLCHAIN_DIR)/lib64' ]; then cp -a '$(TOOLCHAIN_DIR)/lib64'/. $(VSCODE_SERVER_DIR)/gnu; fi
+ 	if [ -e '$(CROSS_LIB64DIR)' ]; then cp -a '$(CROSS_LIB64DIR)'/. $(VSCODE_SERVER_DIR)/gnu; fi
+ 	cp -a '$(CROSS_LIBDIR)'/. $(VSCODE_SERVER_DIR)/gnu
+ 	find $(VSCODE_SERVER_DIR)/gnu -regex '.*\.\(a\|la\|o\|py\|spec\)' -delete
+diff --git a/scripts/apt-install.sh b/scripts/apt-install.sh
+new file mode 100755
+index 0000000..0598361
+--- /dev/null
++++ b/scripts/apt-install.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++set -xeu
++
++export DEBIAN_FRONTEND=noninteractive
++apt-get update
++apt-get install -y \
++    autoconf \
++    automake \
++    bison \
++    build-essential \
++    ca-certificates \
++    curl \
++    diffutils \
++    flex \
++    gawk \
++    libtool \
++    make \
++    patch \
++    perl \
++    python3 \
++    rsync \
++    xz-utils
+diff --git a/scripts/build-gcc-toolchain.sh b/scripts/build-gcc-toolchain.sh
+index 0d2ea71..edbe18e 100755
+--- a/scripts/build-gcc-toolchain.sh
++++ b/scripts/build-gcc-toolchain.sh
+@@ -2,7 +2,7 @@
+ set -xeu
+ cd "$(dirname "$0")"
+ 
+-: "${BUILD_TRIPLET:="$(uname -m)-redhat-linux"}"
++: "${BUILD_TRIPLET:="$(uname -m)-pc-linux-gnu"}"
+ : "${TARGET_TRIPLET:="$(uname -m)-linux-gnu"}"
+ : "${BUILDDIR:="$(realpath ../builddir)"}"
+ 
+@@ -38,13 +38,9 @@ for depname in gmp mpfr mpc; do
+ done
+ 
+ 
+-# ====================
+-# Linux kernel headers
+-cd "$BUILDDIR/linux"
+-
+-make ARCH="$KERNEL_ARCH" defconfig
+-make ARCH="$KERNEL_ARCH" INSTALL_HDR_PATH="$PREFIX/$TARGET_TRIPLET" headers_install
+-
++sed -i \
++    's/^#if _GLIBCXX_HAVE_XLOCALE_H$/#if _GLIBCXX_HAVE_XLOCALE_H \&\& !defined(__GLIBC__)/' \
++    "$BUILDDIR/gcc/libstdc++-v3/src/c++17/floating_from_chars.cc"
+ 
+ # ====================
+ # Binutils
+@@ -75,6 +71,8 @@ cd builddir
+     --host="$BUILD_TRIPLET" \
+     --target="$TARGET_TRIPLET" \
+     --prefix="$PREFIX" \
++    --libdir="$PREFIX/$TARGET_TRIPLET/lib" \
++    --with-toolexeclibdir="$PREFIX/$TARGET_TRIPLET/lib" \
+     --enable-languages=c,c++ \
+     --disable-libatomic \
+     --disable-multilib \
+@@ -84,6 +82,18 @@ make -j$(nproc) all-gcc
+ make install-gcc
+ 
+ 
++# ====================
++# Linux kernel headers
++cd "$BUILDDIR/linux"
++
++make \
++    CC="$PREFIX/bin/$TARGET_TRIPLET-gcc" \
++    LD="$PREFIX/$TARGET_TRIPLET/bin/ld" \
++    ARCH="$KERNEL_ARCH" \
++    defconfig
++make ARCH="$KERNEL_ARCH" INSTALL_HDR_PATH="$PREFIX/$TARGET_TRIPLET" headers_install
++
++
+ # ====================
+ # GLIBC (headers)
+ cd "$BUILDDIR/glibc"
+@@ -139,7 +149,11 @@ make distclean
+     --target="$TARGET_TRIPLET" \
+     --prefix="$PREFIX" \
+     --includedir="$PREFIX/$TARGET_TRIPLET/include" \
++    --libdir="$PREFIX/$TARGET_TRIPLET/lib" \
++    --with-sysroot="$PREFIX/$TARGET_TRIPLET" \
++    --with-toolexeclibdir="$PREFIX/$TARGET_TRIPLET/lib" \
+     --enable-languages=c,c++ \
++    --disable-bootstrap \
+     --disable-multilib
+ 
+ make -j$(nproc)

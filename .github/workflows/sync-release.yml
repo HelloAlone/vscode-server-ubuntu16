@@ -1,0 +1,184 @@
+name: Sync upstream release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  Find-Latest-Release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_required: ${{ steps.upstream.outputs.release_required }}
+      upstream_tag: ${{ steps.upstream.outputs.upstream_tag }}
+      release_tag: ${{ steps.upstream.outputs.release_tag }}
+    steps:
+      - name: Resolve latest upstream release
+        id: upstream
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          upstream_tag="$(gh release view --repo MikeWang000000/vscode-server-centos7 --json tagName --jq .tagName)"
+          release_tag="v${upstream_tag#v}-ubuntu16"
+
+          if gh release view --repo "$GITHUB_REPOSITORY" "$release_tag" >/dev/null 2>&1; then
+            echo "release_required=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_required=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+  Build:
+    needs: Find-Latest-Release
+    if: needs.Find-Latest-Release.outputs.release_required == 'true'
+    strategy:
+      matrix:
+        arch: [x64, arm64, armhf]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out wrapper repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check out upstream release
+        env:
+          UPSTREAM_TAG: ${{ needs.Find-Latest-Release.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          git -C upstream fetch --force origin "refs/tags/$UPSTREAM_TAG:refs/tags/$UPSTREAM_TAG"
+          git -C upstream checkout --detach "$UPSTREAM_TAG"
+          git -C upstream submodule update --init --recursive
+
+      - name: Apply Ubuntu 16.04 patch
+        run: scripts/apply-ubuntu16-patch.sh
+
+      - name: Build ${{ matrix.arch }} archive on Ubuntu 16.04
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace/upstream \
+            --env BUILD_ARCH \
+            ubuntu:16.04 \
+            bash -c '
+              set -euo pipefail
+              scripts/apt-install.sh
+              make ARCH="$BUILD_ARCH"
+            '
+
+      - name: Upload ${{ matrix.arch }} archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-server_${{ matrix.arch }}
+          path: upstream/dist/vscode-server_*_${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  Smoke-Test:
+    needs: [Find-Latest-Release, Build]
+    if: needs.Find-Latest-Release.outputs.release_required == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download x64 archive
+        uses: actions/download-artifact@v4
+        with:
+          name: vscode-server_x64
+          path: dist
+
+      - name: Smoke test x64 archive on Ubuntu 16.04
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --workdir /workspace \
+            ubuntu:16.04 \
+            bash -c '
+              set -euo pipefail
+              mkdir /tmp/vscode-server
+              tar xzf dist/vscode-server_*_x64.tar.gz -C /tmp/vscode-server --strip-components 1
+              /tmp/vscode-server/code-latest --patch-now
+              /tmp/vscode-server/code-latest --version
+            '
+
+  Publish:
+    permissions:
+      contents: write
+    needs: [Find-Latest-Release, Build, Smoke-Test]
+    if: needs.Find-Latest-Release.outputs.release_required == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out wrapper repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set upstream submodule to the release
+        env:
+          UPSTREAM_TAG: ${{ needs.Find-Latest-Release.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          git -C upstream fetch --force origin "refs/tags/$UPSTREAM_TAG:refs/tags/$UPSTREAM_TAG"
+          git -C upstream checkout --detach "$UPSTREAM_TAG"
+
+      - name: Apply Ubuntu 16.04 patch
+        run: scripts/apply-ubuntu16-patch.sh
+
+      - name: Package corresponding source
+        env:
+          UPSTREAM_TAG: ${{ needs.Find-Latest-Release.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          tar --exclude-vcs --owner=0 --group=0 -czf "dist/vscode-server_${UPSTREAM_TAG#v}_ubuntu16_source.tar.gz" \
+            README.md LICENSE.txt patches scripts upstream
+
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vscode-server_*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.Find-Latest-Release.outputs.upstream_tag }}
+          RELEASE_TAG: ${{ needs.Find-Latest-Release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          git config user.name 'GitHub Actions'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add upstream
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: Update upstream to $UPSTREAM_TAG"
+            git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          fi
+
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null; then
+            git tag -a "$RELEASE_TAG" -m "Ubuntu 16.04 build of upstream $UPSTREAM_TAG"
+            git push origin "$RELEASE_TAG"
+          fi
+
+          if ! gh release view --repo "$GITHUB_REPOSITORY" "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create --repo "$GITHUB_REPOSITORY" "$RELEASE_TAG" dist/*.tar.gz \
+              --title "VS Code Server $UPSTREAM_TAG for Ubuntu 16.04" \
+              --notes "Ubuntu 16.04 build of [upstream release $UPSTREAM_TAG](https://github.com/MikeWang000000/vscode-server-centos7/releases/tag/$UPSTREAM_TAG). Includes the corresponding source archive." \
+              --verify-tag
+          fi
