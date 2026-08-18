@@ -9,15 +9,16 @@ index 845e2ed..e559c0c 100644
  ARCH := $(shell uname -m)
  
  ifeq ($(ARCH), x86_64)
-@@ -49,6 +49,7 @@ CROSS_CXX = $(CROSS_PREFIX)g++
+@@ -49,6 +49,8 @@ CROSS_CXX = $(CROSS_PREFIX)g++
  CROSS_STRIP = $(TOOLCHAIN_DIR)/$(TARGET_TRIPLET)/bin/strip
  CROSS_LIBDIR = $(TOOLCHAIN_DIR)/$(TARGET_TRIPLET)/lib
  CROSS_LIB64DIR = $(TOOLCHAIN_DIR)/$(TARGET_TRIPLET)/lib64
++CROSS_LIBGCC = $(shell $(CROSS_CC) -print-file-name=libgcc_s.so.1)
 +CROSS_SYSROOT_FLAGS = --sysroot=/
  TOOLCHAIN = $(CROSS_CC) $(CROSS_CXX) $(CROSS_STRIP)
  
  INCLUDES = -I.
-@@ -64,17 +65,17 @@ toolchain: $(TOOLCHAIN)
+@@ -64,17 +66,17 @@ toolchain: $(TOOLCHAIN)
  $(VSCODE_DEPS) $(TOOLCHAIN_DEPS):
  	env TARGET_TRIPLET='$(TARGET_TRIPLET)' bash scripts/download-deps.sh
  
@@ -38,6 +39,12 @@ index 845e2ed..e559c0c 100644
  	$(CROSS_STRIP) --strip-all -R .comment $(CODEBIN)
  
  $(VSCODE_SERVER_TAR): $(VSCODE_DEPS) $(TOOLCHAIN) $(CLI_TAR) $(SRV_TAR) $(CODEBIN)
+@@ -92,4 +94,5 @@ $(VSCODE_SERVER_TAR): $(VSCODE_DEPS) $(TOOLCHAIN) $(CLI_TAR) $(SRV_TAR) $(CODEB
+ 	mkdir -p $(VSCODE_SERVER_DIR)/gnu
+ 	if [ -e '$(CROSS_LIB64DIR)' ]; then cp -a '$(CROSS_LIB64DIR)'/. $(VSCODE_SERVER_DIR)/gnu; fi
+ 	cp -a '$(CROSS_LIBDIR)'/. $(VSCODE_SERVER_DIR)/gnu
++	cp -a '$(CROSS_LIBGCC)' $(VSCODE_SERVER_DIR)/gnu
+ 	find $(VSCODE_SERVER_DIR)/gnu -regex '.*\.\(a\|la\|o\|py\|spec\)' -delete
 diff --git a/scripts/apt-install.sh b/scripts/apt-install.sh
 new file mode 100755
 index 0000000..0598361
